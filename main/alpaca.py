@@ -3,16 +3,27 @@ import numpy as np
 import time
 from copy import deepcopy
 from tensorflow.python.ops.parallel_for import gradients
+import tensorflow_probability as tfp
+from .dataset import Dataset
+import random
 
 
 class ALPaCA:
     def __init__(self, config, sess, graph=None, preprocess=None, f_nom=None):
+        #tf.random.set_random_seed(21)
         self.config = deepcopy(config)
         self.lr = config['lr']
+        self.weight_decay = config['weight_decay']
         self.x_dim = config['x_dim']
         self.phi_dim = config['nn_layers'][-1]
         self.y_dim = config['y_dim']
         self.sigma_eps = self.config['sigma_eps']
+        self.loss_type = config['loss_type']
+        self.optimizer_type = config['optimizer']
+        self.fixL = config['fixL']
+        self.impl_c = config['impl_c']
+        self.loss_full_cov = config['loss_full_cov']
+        self.learn_sigma = config['learn_sigma']
 
         self.updates_so_far = 0
         self.sess = sess
@@ -33,13 +44,19 @@ class ALPaCA:
             self.SigEps = tf.reshape(self.SigEps, (1,1,self.y_dim,self.y_dim))
             
             # try making it learnable
-            #self.SigEps = tf.get_variable('sigma_eps', initializer=self.SigEps )
+            if self.learn_sigma:
+                self.SigEps = tf.get_variable('sigma_eps', initializer=self.SigEps)
 
             # Prior Parameters of last layer
             self.K = tf.get_variable('K_init',shape=[last_layer,self.y_dim]) #\bar{K}_0
 
-            self.L_asym = tf.get_variable('L_asym',shape=[last_layer,last_layer]) # cholesky decomp of \Lambda_0
+            if self.fixL:
+                self.L_asym = tf.eye(last_layer)
+            else:
+                self.L_asym = tf.get_variable('L_asym',shape=[last_layer,last_layer]) # cholesky decomp of \Lambda_0
+
             self.L = self.L_asym @ tf.transpose(self.L_asym) # \Lambda_0
+            self.L_inv = tf.matrix_inverse(self.L)
             
             # x: query points (M, N_test, x_dim)
             # y: target points (M, N_test, y_dim) ( what K^T phi(x) should approximate )
@@ -91,15 +108,45 @@ class ALPaCA:
 
             # Compute posterior predictive distribution, and evaluate targets self.y under this distribution
             self.mu_pred, self.Sig_pred, self.predictive_nll = self.compute_pred_and_nll()
-            
+
+            self.posterior_dist_vec = tfp.distributions.Normal(tf.squeeze(self.mu_pred), tf.squeeze(tf.sqrt(self.Sig_pred)))
+
+            self.sig_full = self.compute_full_covariance()
+
+            self.posterior_dist = tfp.distributions.MultivariateNormalFullCovariance(tf.squeeze(self.mu_pred, -1), self.sig_full)
+
+            self.ll_pred = self.posterior_dist.log_prob(tf.squeeze(self.y, -1))
+
+            self.calib_error = self.calc_calib_error()
+
+            # Prior likelihood loss
+            self.mu_prior, _, self.prior_nll = self.compute_nmll()
+            self.sig_full_prior = self.compute_full_covariance_prior()
+            self.prior_dist = tfp.distributions.MultivariateNormalFullCovariance(tf.squeeze(self.mu_prior, -1), self.sig_full_prior)
+
+            # Optimizer
+            assert self.optimizer_type in ['Adam', 'AdamW']
+            if self.optimizer_type == 'Adam':
+                self.optimizer = tf.train.AdamOptimizer(self.lr)
+            elif self.optimizer_type == 'AdamW':
+                self.optimizer = tf.contrib.opt.AdamWOptimizer(weight_decay=self.weight_decay, learning_rate=self.lr)
+
             # The loss function is expectation of this predictive nll.
-            self.total_loss = tf.reduce_mean(self.predictive_nll)
+            if self.loss_full_cov:
+                self.total_loss = tf.reduce_mean(-self.ll_pred)
+                self.prior_loss = tf.reduce_mean(-self.prior_dist.log_prob(tf.squeeze(self.y, -1)))
+            else:
+                self.total_loss = tf.reduce_mean(self.predictive_nll)
+                self.prior_loss = tf.reduce_mean(self.prior_nll)
+
+
             tf.summary.scalar('total_loss', self.total_loss)
 
-            self.optimizer = tf.train.AdamOptimizer(self.lr)
-
             global_step = tf.Variable(0, trainable=False, name='global_step')
-            self.train_op = self.optimizer.minimize(self.total_loss,global_step=global_step)
+            if self.loss_type == 'post':
+                self.train_op = self.optimizer.minimize(self.total_loss, global_step=global_step)
+            elif self.loss_type == 'prior':
+                self.train_op = self.optimizer.minimize(self.prior_loss, global_step=global_step)
 
             self.train_writer = tf.summary.FileWriter('summaries/'+str(time.time()), self.sess.graph, flush_secs=10)
             self.merged = tf.summary.merge_all()
@@ -153,6 +200,7 @@ class ALPaCA:
         # Score self.y under predictive distribution to obtain loss
         with tf.variable_scope('loss', reuse=None):
             logdet = self.y_dim*tf.log(spread_fac) + tf.linalg.logdet(self.SigEps)
+            #logdet = tf.expand_dims(tf.linalg.logdet(Sig_pred), -1) #equivalent to above
             Sig_pred_inv = tf.linalg.inv(Sig_pred)
             quadf = batch_quadform(Sig_pred_inv, (self.y - mu_pred))
 
@@ -166,31 +214,107 @@ class ALPaCA:
         
         return mu_pred, Sig_pred, predictive_nll
 
-    
+    def compute_nmll(self):
+        """
+        Uses self.K and self.L_inv and self.f_nom_x to generate the prior likelihood.
+        Returns:
+            mu_pred = posterior predictive mean at query points self.x
+                        shape (M, T, y_dim)
+            Sig_pred = posterior predictive variance at query points self.x
+                        shape (M, T, y_dim, y_dim)
+            predictive_nll = negative log likelihood of self.y under the posterior predictive density
+                        shape (M, T)
+        """
+        mu_prior = tf.tensordot(self.phi, self.K, [[2], [0]]) + self.f_nom_x
+        spread_fac = 1 + tf.squeeze(tf.matrix_transpose(tf.expand_dims(tf.tensordot(self.phi, self.L_inv, [[2], [0]]), -1))@tf.expand_dims(self.phi, -1), -1)
+        Sig_prior = tf.expand_dims(spread_fac, axis=-1) * tf.reshape(self.SigEps, (1, 1, self.y_dim, self.y_dim))
+
+        # Score self.y under predictive distribution to obtain loss
+        with tf.variable_scope('loss_mll', reuse=None):
+            logdet = self.y_dim * tf.log(spread_fac) + tf.linalg.logdet(self.SigEps)
+            Sig_prior_inv = tf.linalg.inv(Sig_prior)
+            quadf = batch_quadform(Sig_prior_inv, (self.y - mu_prior))
+
+        prior_nll = tf.squeeze(logdet + quadf, axis=-1)
+
+        # log stuff for summaries
+        # self.rmse_1 = tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square(mu_pred - self.y)[:, 0, :], axis=-1)))
+        # self.mpv_1 = tf.reduce_mean(tf.matrix_determinant(Sig_pred[:, 0, :, :]))
+        # tf.summary.scalar('RMSE_1step', self.rmse_1)
+        # tf.summary.scalar('MPV_1step', self.mpv_1)
+
+        return mu_prior, Sig_prior, prior_nll
+
+    def compute_full_covariance(self):
+        if self.y_dim == 1:
+            Sig_full = self.phi @ self.posterior_L_inv @ tf.matrix_transpose(self.phi)
+            Sig_full += tf.eye(tf.shape(Sig_full)[1])
+            Sig_full *= tf.squeeze(self.SigEps)
+            return Sig_full
+        else:
+            raise ValueError('Multi-dim regression is not supported.')
+
+    def compute_full_covariance_prior(self):
+        if self.y_dim == 1:
+            Sig_full = tf.tensordot(self.phi, self.L_inv, [[2], [0]])@tf.matrix_transpose(self.phi)
+            Sig_full += tf.eye(tf.shape(Sig_full)[1])
+            Sig_full *= tf.squeeze(self.SigEps)
+            return Sig_full
+        else:
+            raise ValueError('Multi-dim regression is not supported.')
+
+
     # ---- Train and Test functions ------ #
-    def train(self, dataset, num_train_updates):
+    def train(self, dataset, num_train_updates, valid_dataset = None):
         batch_size = self.config['meta_batch_size']
         horizon = self.config['data_horizon']
         test_horizon = self.config['test_horizon']
 
         #minimize loss
         for i in range(num_train_updates):
-            x,y = dataset.sample(n_funcs=batch_size, n_samples=horizon+test_horizon)
+            if isinstance(dataset, Dataset):
+                x,y = dataset.sample(n_funcs=batch_size, n_samples=horizon+test_horizon)
+            else:
+                task_batch = random.sample(dataset, batch_size)
+                x = np.asarray([task[0] for task in task_batch])
+                y = np.asarray([task[1] for task in task_batch])
 
-            feed_dict = {
-                    self.context_y: y[:,:horizon,:],
-                    self.context_x: x[:,:horizon,:],
-                    self.y: y[:,horizon:,:],
-                    self.x: x[:,horizon:,:],
-                    self.num_context: np.random.randint(horizon+1,size=batch_size)
+            if self.loss_type == 'post':
+                if self.impl_c:
+                    num_context = np.random.randint(x.shape[1])
+                    feed_dict = {
+                            self.context_y: y[:, :, :],
+                            self.context_x: x[:, :, :],
+                            self.y: y[:, num_context:num_context+1, :],
+                            self.x: x[:, num_context:num_context+1, :],
+                            self.num_context: np.repeat(num_context, batch_size)
+                            }
+                else:
+                    feed_dict = {
+                        self.context_y: y[:, :horizon, :],
+                        self.context_x: x[:, :horizon, :],
+                        self.y: y[:, horizon:, :],
+                        self.x: x[:, horizon:, :],
+                        self.num_context: np.random.randint(horizon + 1, size=batch_size)
                     }
 
-            summary,loss, _ = self.sess.run([self.merged,self.total_loss,self.train_op],feed_dict)
+                summary, loss, _ = self.sess.run([self.merged, self.total_loss, self.train_op], feed_dict)
+            elif self.loss_type == 'prior':
+                feed_dict = {
+                        self.y: y[:, :, :],
+                        self.x: x[:, :, :]
+                        }
+                loss, _ = self.sess.run([self.prior_loss, self.train_op], feed_dict)
 
-            if i % 50 == 0:
-                print('loss:',loss)
+            if i % 1000 == 0:
+                if valid_dataset is not None:
+                    alpaca_ll, alpaca_rmse, alpaca_calib = self.eval_datasets(valid_dataset)
+                    print('Iteration: %i, Loss: %.3f - Valid-LL: %.3f - Valid-RMSE: %.3f - Calib-Err %.3f ' % (i, loss, alpaca_ll, alpaca_rmse, alpaca_calib))
+                else:
+                    print('loss:', loss)
 
-            self.train_writer.add_summary(summary, self.updates_so_far)
+
+            #self.train_writer.add_summary(summary, self.updates_so_far)
             self.updates_so_far += 1
 
     # x_c, y_c, x are all [N, n]
@@ -203,6 +327,50 @@ class ALPaCA:
         }
         mu_pred, Sig_pred = self.sess.run([self.mu_pred, self.Sig_pred], feed_dict)
         return mu_pred, Sig_pred
+
+    def calc_calib_error(self):
+        cdf_vals = tf.squeeze(self.posterior_dist_vec.cdf(tf.squeeze(self.y, -1)))
+
+        num_points = tf.dtypes.cast(tf.shape(self.y)[1], tf.float32)
+        conf_levels = tf.linspace(0.05, 0.95, 20)
+        emp_freq_per_conf_level = tf.reduce_sum(tf.dtypes.cast(tf.math.less_equal(cdf_vals, tf.expand_dims(conf_levels, -1)), tf.float32), axis=1) / num_points
+        calib_rmse_err = tf.sqrt(tf.reduce_mean((emp_freq_per_conf_level - conf_levels) ** 2))
+        return calib_rmse_err
+
+
+    def eval(self, x_c, y_c, x_t, y_t):
+        x_c = x_c.reshape(1, -1, self.x_dim)
+        y_c = y_c.reshape(1, -1, self.y_dim)
+        x_t = x_t.reshape(1, -1, self.x_dim)
+        y_t = y_t.reshape(1, -1, self.y_dim)
+        feed_dict = {
+            self.context_y: y_c,
+            self.context_x: x_c,
+            self.x: x_t,
+            self.y: y_t
+        }
+        y_pred_mu, y_pred_sigma, ll, calib_error = self.sess.run([self.mu_pred, self.Sig_pred, self.ll_pred, self.calib_error], feed_dict)
+        avg_log_likelihood = np.mean(ll / y_t.shape[1])
+        rmse = np.sqrt(np.mean((y_pred_mu-y_t)**2))
+        return avg_log_likelihood, rmse, calib_error
+
+
+    def eval_datasets(self, test_tuples, flatten_y=True, **kwargs):
+        """
+        Computes the average test log likelihood, the rmse and the calibration error over multiple test datasets
+
+        Args:
+            test_tuples: list of test set tuples, i.e. [(test_context_x_1, test_context_y_1, test_x_1, test_y_1), ...]
+
+        Returns: (avg_log_likelihood, rmse, calibr_error)
+
+        """
+
+        assert (all([len(valid_tuple) == 4 for valid_tuple in test_tuples]))
+
+        ll_list, rmse_list, calibr_err_list = list(zip(*[self.eval(*test_data_tuple, **kwargs) for test_data_tuple in test_tuples]))
+
+        return np.mean(ll_list), np.mean(rmse_list), np.mean(calibr_err_list)
 
     # convenience function to use just the encoder on numpy input
     def encode(self, x):
